@@ -48,6 +48,17 @@ except ImportError as e:
     print("Actual error:", e)
     ros2_available = False
 
+mavros_msgs_available = True
+try:
+    from mavros_msgs.msg import (  # pylint: disable=import-error
+        ESCInfo,
+        ESCInfoItem,
+        ESCStatus,
+        ESCStatusItem,
+    )
+except ImportError:
+    mavros_msgs_available = False
+
 
 def main():
     """Command line interface"""
@@ -122,6 +133,18 @@ def main():
         default=False,
     )
 
+    parser.add_argument(
+        "--mavros-esc",
+        dest="mavros_esc",
+        action="store_true",
+        help=(
+            "Also synthesize mavros_msgs/ESCStatus (/mavros/esc_status/status) and"
+            " mavros_msgs/ESCInfo (/mavros/esc_status/info) from esc_status at"
+            " 10 Hz, as PX4 streams ESC_STATUS/ESC_INFO to MAVROS."
+        ),
+        default=False,
+    )
+
     args = parser.parse_args()
 
     if not ros2_available:
@@ -136,6 +159,7 @@ def main():
         args.verbose,
         args.tf,
         args.nav,
+        args.mavros_esc,
     )
 
 
@@ -155,6 +179,7 @@ def convert_ulog2ros2bag(
     verbose=False,
     want_tf=False,
     want_nav=False,
+    want_esc=False,
 ):
     """
     Coverts and ULog file to a CSV file.
@@ -164,6 +189,7 @@ def convert_ulog2ros2bag(
     :param messages: A list of message names
     :param want_tf: Also synthesize /tf and /tf_static
     :param want_nav: Also synthesize Odometry, Path and NavSatFix
+    :param want_esc: Also synthesize MAVROS ESCStatus and ESCInfo
 
     :return: No
     """
@@ -176,6 +202,8 @@ def convert_ulog2ros2bag(
         for required in DERIVED_SOURCE_MESSAGES:
             if required not in msg_filter:
                 msg_filter.append(required)
+    if msg_filter is not None and want_esc and "esc_status" not in msg_filter:
+        msg_filter.append("esc_status")
 
     ulog = ULog(ulog_file_name, msg_filter, disable_str_exceptions)
 
@@ -329,9 +357,16 @@ def convert_ulog2ros2bag(
         topic_count += 1
         message_count += topic_message_count
 
-    if want_tf or want_nav:
+    if want_tf or want_nav or want_esc:
         derived_topics, derived_messages = write_derived_topics(
-            ulog, writer, topic_metadata, rosbag_write, want_tf, want_nav, verbose
+            ulog,
+            writer,
+            topic_metadata,
+            rosbag_write,
+            want_tf,
+            want_nav,
+            verbose,
+            want_esc,
         )
         topic_count += derived_topics
         message_count += derived_messages
@@ -467,6 +502,15 @@ BODY_FRAME = "base_link"
 # Publish the accumulated Path at most this often, in log seconds.
 PATH_PUBLISH_PERIOD_S = 1.0
 
+# PX4 onboard-mode ESC_STATUS/ESC_INFO stream period, in microseconds.
+ESC_PUBLISH_PERIOD_US = 100_000
+
+ESC_STATUS_TOPIC = "/mavros/esc_status/status"
+ESC_INFO_TOPIC = "/mavros/esc_status/info"
+
+# MAVLink ESC_INFO temperature sentinel for "not supplied by ESC".
+ESC_TEMPERATURE_UNKNOWN = 32767
+
 
 def _quat_mul(a, b):
     """Hamilton product of two (w, x, y, z) quaternions."""
@@ -529,6 +573,21 @@ def _stamp_from_us(timestamp_us):
     return Time(sec=ns // 1_000_000_000, nanosec=ns % 1_000_000_000)
 
 
+def _zero_order_hold_indices(ts, period_us):
+    """Tick times every period_us from ts[0] to ts[-1], and the index of the
+    latest sample at or before each tick."""
+    ticks = np.arange(int(ts[0]), int(ts[-1]) + 1, int(period_us), dtype=np.int64)
+    indices = np.searchsorted(ts, ticks, side="right") - 1
+    return ticks, indices
+
+
+def _esc_temperature_cdegc(temperature_degc):
+    """PX4 esc_temperature (degC) -> MAVLink ESC_INFO temperature (cdegC)."""
+    if not math.isfinite(temperature_degc):
+        return ESC_TEMPERATURE_UNKNOWN
+    return int(max(-32768.0, min(32767.0, temperature_degc * 100.0)))
+
+
 def _topic_data_by_name(ulog):
     """Map ULog message name -> Data, preferring the multi_id 0 instance."""
     result = {}
@@ -539,9 +598,17 @@ def _topic_data_by_name(ulog):
 
 
 def write_derived_topics(
-    ulog, writer, topic_metadata, rosbag_write, want_tf, want_nav, verbose
+    ulog,
+    writer,
+    topic_metadata,
+    rosbag_write,
+    want_tf,
+    want_nav,
+    verbose,
+    want_esc=False,
 ):
-    """Synthesize /tf(+static), Odometry, Path and NavSatFix from PX4 messages.
+    """Synthesize /tf(+static), Odometry, Path, NavSatFix and MAVROS ESC
+    topics from PX4 messages.
 
     Returns (topic_count, message_count) added to the bag.
     """
@@ -709,6 +776,64 @@ def write_derived_topics(
                 fix.altitude = alt
                 fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
                 write("/gps/fix", fix, ts_arr[i])
+
+    # ---- MAVROS ESCStatus/ESCInfo from esc_status, zero-order hold at 10 Hz ----
+    if want_esc:
+        esc = data.get("esc_status")
+        if esc is not None and not mavros_msgs_available:
+            esc = None
+            print(
+                "W: --mavros-esc requested but mavros_msgs is not available;"
+                " skipping ESC topics."
+            )
+        elif esc is None:
+            print(
+                "W: --mavros-esc requested but 'esc_status' is not in the ULog;"
+                " skipping ESC topics."
+            )
+
+        if esc is not None:
+            create(ESC_STATUS_TOPIC, "mavros_msgs/msg/ESCStatus")
+            create(ESC_INFO_TOPIC, "mavros_msgs/msg/ESCInfo")
+            ed = esc.data
+            ticks, indices = _zero_order_hold_indices(
+                ed["timestamp"], ESC_PUBLISH_PERIOD_US
+            )
+            for tick, j in zip(ticks, indices):
+                stamp = _stamp_from_us(tick)
+                count = int(ed["esc_count"][j])
+
+                status = ESCStatus()
+                status.header.stamp = stamp
+                info = ESCInfo()
+                info.header.stamp = stamp
+                info.counter = int(ed["counter"][j]) & 0xFFFF
+                info.count = count
+                info.connection_type = int(ed["esc_connectiontype"][j])
+                info.info = int(ed["esc_online_flags"][j]) & 0xFF
+
+                for k in range(count):
+                    p = f"esc[{k}]."
+                    if p + "esc_rpm" not in ed:
+                        break
+                    item = ESCStatusItem()
+                    item.header = status.header
+                    item.rpm = int(ed[p + "esc_rpm"][j])
+                    item.voltage = float(ed[p + "esc_voltage"][j])
+                    item.current = float(ed[p + "esc_current"][j])
+                    status.esc_status.append(item)
+
+                    info_item = ESCInfoItem()
+                    info_item.header = info.header
+                    info_item.failure_flags = int(ed[p + "failures"][j])
+                    info_item.error_count = int(ed[p + "esc_errorcount"][j])
+                    info_item.temperature = _esc_temperature_cdegc(
+                        float(ed[p + "esc_temperature"][j])
+                    )
+                    info.esc_info.append(info_item)
+
+                write(ESC_STATUS_TOPIC, status, tick)
+                write(ESC_INFO_TOPIC, info, tick)
 
     if verbose:
         print(f"D: derived topics added: {topic_count}, messages: {message_count}")
